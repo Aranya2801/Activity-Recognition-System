@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo_banner.svg" width="100%" alt="Activity Recognition System"/>
+<img src="logo_banner.png" width="100%" alt="Activity Recognition System"/>
 
 # 🏃 Activity Recognition System
 
