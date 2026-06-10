@@ -1,0 +1,252 @@
+version: "3.9"
+
+# ============================================================
+# Activity Recognition System — Full Stack Docker Compose
+# ============================================================
+
+x-common-env: &common-env
+  APP_ENV: ${APP_ENV:-development}
+  DATABASE_URL: postgresql+asyncpg://ars_user:ars_password@postgres:5432/ars_db
+  REDIS_URL: redis://redis:6379/0
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-deploy-defaults: &deploy-defaults
+  restart_policy:
+    condition: on-failure
+    delay: 5s
+    max_attempts: 3
+
+services:
+  # ---- Core API ----
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ${BUILD_TARGET:-development}
+    container_name: ars-api
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      APP_PORT: 8000
+      INFERENCE_DEVICE: ${INFERENCE_DEVICE:-cpu}
+    volumes:
+      - ./src:/app/src
+      - ./configs:/app/configs
+      - ./models:/app/models
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ars-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # ---- Dashboard ----
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: ars-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      <<: *common-env
+      API_BASE_URL: http://api:8000
+    volumes:
+      - ./src/dashboard:/app/src/dashboard
+    depends_on:
+      - api
+    networks:
+      - ars-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---- Celery Worker (async tasks) ----
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: ars-worker
+    command: celery -A src.pipeline.tasks worker --loglevel=info --concurrency=4
+    environment:
+      <<: *common-env
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./uploads:/app/uploads
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - ars-network
+
+  # ---- Celery Beat (scheduled tasks) ----
+  beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: ars-beat
+    command: celery -A src.pipeline.tasks beat --loglevel=info --scheduler=celery.beat:PersistentScheduler
+    environment:
+      <<: *common-env
+    volumes:
+      - ./src:/app/src
+      - celery-beat-data:/app/celerybeat-schedule
+    depends_on:
+      - redis
+    networks:
+      - ars-network
+
+  # ---- PostgreSQL ----
+  postgres:
+    image: postgres:15-alpine
+    container_name: ars-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ars_db
+      POSTGRES_USER: ars_user
+      POSTGRES_PASSWORD: ars_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ars-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ars_user -d ars_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Redis ----
+  redis:
+    image: redis:7-alpine
+    container_name: ars-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - ars-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- MLflow ----
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: ars-mlflow
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://ars_user:ars_password@postgres:5432/mlflow_db
+      --default-artifact-root /mlartifacts
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - mlflow-artifacts:/mlartifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ars-network
+
+  # ---- Prometheus ----
+  prometheus:
+    image: prom/prometheus:v2.47.2
+    container_name: ars-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    networks:
+      - ars-network
+
+  # ---- Grafana ----
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: ars-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ars_grafana_password
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - ars-network
+
+  # ---- Nginx (reverse proxy) ----
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: ars-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/ssl:/etc/nginx/ssl
+    depends_on:
+      - api
+      - dashboard
+    networks:
+      - ars-network
+
+networks:
+  ars-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  mlflow-artifacts:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  celery-beat-data:
+    driver: local

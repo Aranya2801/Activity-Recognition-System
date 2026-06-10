@@ -1,0 +1,81 @@
+stages:
+  download_datasets:
+    cmd: python scripts/download_datasets.py --datasets uci_har wisdm --synthetic-only
+    deps:
+      - scripts/download_datasets.py
+    outs:
+      - data/raw/uci_har:
+          cache: true
+      - data/raw/wisdm:
+          cache: true
+
+  prepare_features:
+    cmd: python src/pipeline/data_ingestion.py --prepare-features
+    deps:
+      - src/pipeline/data_ingestion.py
+      - data/raw/uci_har
+      - data/raw/wisdm
+    outs:
+      - data/features/uci_har_train.npy
+      - data/features/uci_har_val.npy
+      - data/features/wisdm_train.npy
+      - data/features/wisdm_val.npy
+
+  train_sensor_transformer:
+    cmd: >
+      python scripts/train_sensor_models.py
+      --model transformer
+      --dataset uci_har
+      --epochs 100
+      --synthetic
+    deps:
+      - scripts/train_sensor_models.py
+      - src/models/sensor/transformer_model.py
+      - src/pipeline/training.py
+      - data/raw/uci_har
+    params:
+      - configs/training_config.yaml:
+          - sensor_training.learning_rate
+          - sensor_training.num_epochs
+          - sensor_training.batch_size
+    outs:
+      - models/weights/best_model.pth:
+          cache: true
+    metrics:
+      - results/metrics.json:
+          cache: false
+
+  train_cnn_lstm:
+    cmd: >
+      python scripts/train_sensor_models.py
+      --model cnn_lstm
+      --dataset wisdm
+      --epochs 50
+      --synthetic
+    deps:
+      - scripts/train_sensor_models.py
+      - src/models/sensor/cnn_lstm_model.py
+      - data/raw/wisdm
+    outs:
+      - models/weights/cnn_lstm_wisdm.pth:
+          cache: true
+
+  evaluate_all:
+    cmd: python scripts/evaluate_models.py --synthetic --output results/evaluation.json
+    deps:
+      - scripts/evaluate_models.py
+      - src/utils/metrics.py
+      - models/weights/best_model.pth
+    metrics:
+      - results/evaluation.json:
+          cache: false
+
+  export_onnx:
+    cmd: python scripts/export_edge_models.py --model transformer
+    deps:
+      - scripts/export_edge_models.py
+      - src/edge/onnx_export.py
+      - models/weights/best_model.pth
+    outs:
+      - models/edge/sensor_transformer.onnx:
+          cache: true
